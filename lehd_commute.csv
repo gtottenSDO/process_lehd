@@ -1,4 +1,4 @@
-year,cty,total_live_work,total_commute_in,total_commute_out,net_commute
+year,county_fips,total_live_work,total_commute_in,total_commute_out,net_commute
 2002,001,55959,90458,-138651,-48193
 2002,003,4488,2280,-1727,553
 2002,005,97337,180718,-150323,30395

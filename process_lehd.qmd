@@ -1,0 +1,440 @@
+---
+
+---
+
+The following notebook is for processing LEHD files
+
+```{r}
+library(tidyverse)
+library(duckdb)
+library(DBI)
+library(dbplyr)
+library(connections)
+library(httr2)
+library(xml2)
+library(RPostgres)
+library(keyring)
+```
+
+```{r}
+# create connection to duckdb with file name "lehd_data.duckdb"
+
+lehd_con <- dbConnect(duckdb::duckdb(), "lehd_data.duckdb")
+
+connection_open(duckdb(), "lehd_data.duckdb")
+```
+
+## Mutiple Job Holding Rate
+
+Multiple Job Holdings Rates are derived from the LODES data from the Census Bureau. The multiple job holding rate is derived using the WAC (worker area characteristics) by taking the percentage difference between All Jobs and All Primary Jobs for each area.
+
+First we create a function that can be used for downloading data from the LEHD servers. This function is used for both calculating Multiple Job Holding Rates and for commuting flows.
+
+```{r}
+# read in state codes
+
+state_codes <- duckdb_read_csv(
+  lehd_con,
+  "state_codes",
+  "lehd_files/state_codes.txt"
+)
+
+```
+
+```{r}
+
+# create function for downloading lehd_data out_of_state flag determines if it downloads the "aux" file, which is for jobs where residence is out of state. LEHD source are options are "od" (origin_destination), "wac" (worker area characteristics), and "rac" (resident area charactersitics). Job types begin with JT00 (for all jobs) with additional JT designations based on designations such as private, private primary, etc
+download_lehd_state <- function(
+  state_code,
+  lehd_source = "od",
+  file_type = c("xwalk", "aux", "main"),
+  job_type = "JT00"
+) {
+  # determine where files will go based on file type or state
+  folder_ext <- case_when(
+    file_type == "xwalk" ~ "xwalk/",
+    state_code == "co" ~ "co/",
+    .default = "other/"
+  )
+
+  # Create a vector of URLs
+
+  lehd_base_url <- ifelse(
+    file_type == "xwalk",
+    paste0("https://lehd.ces.census.gov/data/lodes/LODES8/", state_code, "/"),
+    paste0(
+      "https://lehd.ces.census.gov/data/lodes/LODES8/",
+      state_code,
+      "/",
+      lehd_source,
+      "/"
+    )
+  )
+
+  lehd_links <- request(lehd_base_url) |>
+    req_perform() |>
+    resp_body_html() |>
+    xml_find_all("//a")
+
+  lehd_file_list <- xml_attr(lehd_links, "href") |>
+    str_subset(file_type) |>
+    str_subset(if_else(file_type == "xwalk", file_type, job_type)) |>
+    str_subset("csv.gz")
+
+  lehd_urls <- c(paste0(lehd_base_url, lehd_file_list))
+
+  # Set up destination folder
+  lehd_dest_folder <- paste0(
+    "lehd_files/",
+    folder_ext
+  )
+
+  dir.create(lehd_dest_folder, showWarnings = FALSE)
+
+  lehd_dest_files <- paste0(lehd_dest_folder, lehd_file_list)
+
+  names(lehd_file_list) <- lehd_file_list |>
+    str_extract("\\d{4}") |>
+    as.integer()
+
+  # Download files using map
+  map2(
+    c(
+      lehd_urls,
+      "https://lehd.ces.census.gov/data/lodes/LODES8/co/co_xwalk.csv.gz"
+    ),
+    c(
+      lehd_dest_files,
+      paste0(lehd_dest_folder, "co_xwalk.csv.gz")
+    ),
+    function(url, dest_file) {
+      # check to see if file exists - if it does skip download
+      if (file.exists(dest_file)) {
+        # cat("File already exists\n")
+        return()
+      } else {
+        tryCatch(
+          {
+            download.file(url, destfile = dest_file, mode = "wb")
+            cat("Downloaded file ", dest_file, "\n")
+          },
+          error = function(e) {
+            cat(
+              "Error downloading file ",
+              dest_file,
+              ":",
+              conditionMessage(e),
+              "\n"
+            )
+          }
+        )
+      }
+    }
+  )
+}
+```
+
+```{r}
+
+wac_grid <- (expand_grid(
+  state_code = "co",
+  lehd_source = "wac",
+  file_type = c("S000"),
+  job_type = c("JT00", "JT01")
+))
+
+wac_results <- pmap(
+  wac_grid,
+  download_lehd_state,
+  .progress = TRUE
+)
+```
+
+```{r}
+states <- tbl(lehd_con, "state_codes") |> pull(Code) |> unique()
+```
+
+```{r}
+od_grid <- (expand_grid(
+  state_code = str_to_lower(states),
+  lehd_source = "od",
+  file_type = c("aux"),
+  job_type = c("JT00")
+)) |>
+  bind_rows(c(
+    state_code = "co",
+    lehd_source = "od",
+    file_type = "main",
+    job_type = "JT00"
+  ))
+
+od_results <- pmap(
+  od_grid,
+  download_lehd_state,
+  .progress = TRUE
+)
+
+```
+
+```{r}
+# read in wac
+dbExecute(
+  lehd_con,
+  "CREATE OR REPLACE TABLE wac AS
+  SELECT * FROM read_csv('lehd_files/*/*wac*.csv.gz',
+  filename = TRUE)"
+)
+```
+
+```{r}
+
+dbExecute(
+  lehd_con,
+  "CREATE OR REPLACE TABLE od AS
+  SELECT * FROM read_csv('lehd_files/*/*od*.csv.gz',
+  union_by_name = TRUE,
+  null_padding = TRUE,
+  filename = TRUE)"
+)
+```
+
+```{r}
+# read in crosswalks
+dbExecute(
+  lehd_con,
+  "CREATE OR REPLACE TABLE lehd_crosswalks AS
+  SELECT * FROM read_csv('lehd_files/xwalk/*xwalk*.csv.gz',
+  filename = TRUE)"
+)
+```
+
+```{r}
+# read in wac
+lehd_mhj <- tbl(lehd_con, "wac") |>
+  select(w_geocode, C000, filename) |>
+  mutate(
+    w_geocode = str_sub(w_geocode, 1, 5),
+    w_state = str_sub(w_geocode, 1, 2),
+    w_cty = str_sub(w_geocode, 3, 5),
+    job_type = regexp_extract(filename, "JT.."),
+    year = as.integer(regexp_extract(filename, "\\d{4}")),
+    .after = w_geocode
+  ) |>
+  summarize(
+    total = sum(C000, na.rm = TRUE),
+    .by = c(w_geocode, w_state, w_cty, job_type, year)
+  ) |>
+  pivot_wider(names_from = job_type, values_from = total) |>
+  mutate(mult_job_hldg_rate = JT00 / JT01 - 1) |>
+  rename(
+    all_jobs = JT00,
+    primary_jobs = JT01,
+    area_fips = w_geocode,
+    state_fips = w_state,
+    county_fips = w_cty
+  ) |>
+  arrange(area_fips, year) |>
+  collect()
+```
+
+```{r}
+dbWriteTable(lehd_con, "lehd_mhj", lehd_mhj, overwrite = TRUE)
+
+write_csv(lehd_mhj, "lehd_mhj.csv")
+```
+
+# Calculate Commuting Flows
+
+Get commuting flows from LEHD data and calculate net commuters by county. Currently only setup for Colorado - add "*aux*" files instead of main for out of state. Broken into a series of steps.
+
+First download the [LODES OD](https://lehd.ces.census.gov/data/#lodes) data from the Census lehd server.
+
+Next read in the LEHD crosswalk file and create a function to read in and process the LEHD data.
+
+This function reads in the data and processes it to calculate inflow, outflow, and net commuters by county. It also saves the data as an rds file to avoid having to read in the data again.
+
+```{r}
+
+# read in LEHD data
+lehd_commute <- tbl(lehd_con, "od") |>
+  select(w_geocode, h_geocode, S000, filename) |>
+  mutate(
+    w_geocode = str_sub(w_geocode, 1, 5),
+    w_state = str_sub(w_geocode, 1, 2),
+    w_cty = str_sub(w_geocode, 3, 5),
+    h_geocode = str_sub(h_geocode, 1, 5),
+    h_state = str_sub(h_geocode, 1, 2),
+    h_cty = str_sub(h_geocode, 3, 5),
+    year = as.integer(regexp_extract(filename, "\\d{4}")),
+    same_county = as.integer(w_geocode == h_geocode)
+  ) |>
+  filter(h_state == "08" | w_state == "08") |>
+  summarise(
+    total = sum(S000, na.rm = TRUE),
+    .by = c(
+      year,
+      h_cty,
+      h_state,
+      w_cty,
+      w_state,
+      same_county
+    )
+  ) |>
+  mutate(
+    total_live_work = total * same_county,
+    total_commute = total - total_live_work
+  )
+
+```
+
+```{r}
+dbWriteTable(lehd_con, "lehd_commute", collect(lehd_commute), overwrite = TRUE)
+```
+
+```{r}
+# calculate inflow commuters
+lehd_workers <- tbl(lehd_con, "lehd_commute") |>
+  filter(w_state == "08") |>
+  summarize(
+    total_commute_in = sum(total_commute),
+    total_live_work = sum(total_live_work),
+    .by = c(year, w_state, w_cty)
+  ) |>
+  arrange(year, w_state, w_cty)
+
+```
+
+```{r}
+dbWriteTable(lehd_con, "lehd_workers", collect(lehd_workers), overwrite = TRUE)
+lehd_workers <- tbl(lehd_con, "lehd_workers")
+lehd_workers
+```
+
+```{r}
+# calculate outflow commuters
+lehd_residents <- tbl(lehd_con, "lehd_commute") |>
+  filter(h_state == "08") |>
+  summarize(
+    total_commute_out = -sum(total_commute),
+    .by = c(year, h_state, h_cty)
+  ) |>
+  arrange(year, h_state, h_cty)
+
+dbWriteTable(
+  lehd_con,
+  "lehd_residents",
+  collect(lehd_residents),
+  overwrite = TRUE
+)
+lehd_residents <- tbl(lehd_con, "lehd_residents")
+lehd_residents
+```
+
+```{r}
+
+# calculate net commuter
+lehd_net <- collect(lehd_workers) |>
+  rename(cty = w_cty) |>
+  full_join(
+    collect(lehd_residents) |>
+      rename(cty = h_cty)
+  ) |>
+  mutate(
+    across(starts_with("total"), ~ replace_na(., 0)),
+    year = year,
+    net_commute = total_commute_in + total_commute_out
+  ) |>
+  select(
+    year,
+    county_fips = cty,
+    total_live_work,
+    total_commute_in,
+    total_commute_out,
+    net_commute
+  ) |>
+  arrange(year, county_fips)
+
+```
+
+```{r}
+dbWriteTable(lehd_con, "lehd_net", lehd_net, overwrite = TRUE)
+
+lehd_net
+```
+
+```{r}
+write_csv(lehd_net, "lehd_commute.csv")
+```
+
+```{r}
+dbDisconnect(lehd_con)
+```
+
+# Write to Postgres
+
+Once created the files are uploaded to the SDO Postgres Table.
+
+```{r}
+#| label: write_to_postgres
+
+# connect to the Postgres database
+pg_sdo <- DBI::dbConnect(
+  RPostgres::Postgres(),
+  dbname = 'dola',
+  host = '104.197.26.248',
+  port = 5433,
+  user = "postgres",
+  password = keyring::key_get("pgsdo", "dola")
+)
+
+connections::connection_view(pg_sdo)
+
+# write the lehd_mhj table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_mhj"),
+  lehd_mhj,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# write the lehd_net table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_net"),
+  lehd_net,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# write the lehd_commute table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_commute"),
+  collect(lehd_commute),
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# write the lehd_workers table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_workers"),
+  collect(lehd_workers),
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# wrote the lehd_residents table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_residents"),
+  collect(lehd_residents),
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# disconnect from the Postgres database
+dbDisconnect(pg_sdo)
+
+```
