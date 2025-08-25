@@ -6,7 +6,6 @@ The following notebook is for processing LEHD files
 
 ```{r}
 library(tidyverse)
-library(duckdb)
 library(DBI)
 library(dbplyr)
 library(connections)
@@ -14,14 +13,23 @@ library(httr2)
 library(xml2)
 library(RPostgres)
 library(keyring)
+library(duckplyr)
 ```
 
 ```{r}
-# create connection to duckdb with file name "lehd_data.duckdb"
+#| label: connect_to_postgres
+# connect to the Postgres database
+pg_sdo <- DBI::dbConnect(
+  RPostgres::Postgres(),
+  dbname = 'dola',
+  host = '104.197.26.248',
+  port = 5433,
+  user = "postgres",
+  password = keyring::key_get("pgsdo", "dola")
+)
 
-lehd_con <- dbConnect(duckdb::duckdb(), "lehd_data.duckdb")
+connections::connection_view(pg_sdo)
 
-connection_open(duckdb(), "lehd_data.duckdb")
 ```
 
 ## Mutiple Job Holding Rate
@@ -33,11 +41,8 @@ First we create a function that can be used for downloading data from the LEHD s
 ```{r}
 # read in state codes
 
-state_codes <- duckdb_read_csv(
-  lehd_con,
-  "state_codes",
-  "lehd_files/state_codes.txt",
-  temporary = TRUE
+state_codes <- read_csv(
+  "lehd_files/state_codes.txt"
 )
 
 
@@ -153,7 +158,9 @@ wac_results <- pmap(
 ```
 
 ```{r}
-states <- tbl(lehd_con, "state_codes") |> pull(Code) |> unique()
+states <- state_codes |>
+  pull(Code) |>
+  unique()
 ```
 
 ```{r}
@@ -181,73 +188,139 @@ od_results <- pmap(
 ``` {r}
 # create function to convert to parquet
 
+# od_missing <- setdiff(
+#   list.files(
+#     "lehd_files/",
+#     pattern = "od.*csv.gz",
+#     recursive = TRUE,
+#     full.names = TRUE
+#   ),
+#   read_parquet_duckdb(
+#     "lehd_files/lehd_od.parquet"
+#   ) |>
+#     select(filename) |>
+#     distinct() |>
+#     pull()
+# ) |>
+#   read_csv_duckdb(
+#     options = list(filename = TRUE)
+#   ) |>
+#   mutate(
+#     w_state = dd$left(w_geocode, 2L),
+#     h_state = dd$left(h_geocode, 2L)
+#   ) |>
+#   filter(h_state == "08" | w_state == "08") |>
+#   pull(filename)
 
-
+# if (length(od_missing) > 0) {
+#   lehd_od <- duckplyr::read_csv_duckdb(
+#     od_csvs,
+#     options = list(filename = TRUE)
+#   ) |>
+#     mutate(
+#       year = as.integer(dd$regexp_extract(filename, "\\d{4}")),
+#       w_geocode = dd$left(w_geocode, 5L),
+#       w_state = dd$left(w_geocode, 2L),
+#       w_cty = dd$substr(w_geocode, 5L),
+#       h_geocode = dd$left(h_geocode, 5L),
+#       h_state = dd$left(h_geocode, 2L),
+#       h_cty = dd$substr(h_geocode, 3L, 5L),
+#       same_county = as.integer(w_geocode == h_geocode),
+#       .before = 1
+#     ) |>
+#     filter(h_state == "08" | w_state == "08") |>
+#   compute_parquet(
+#     "lehd_files/lehd_od.parquet"
+#   )
+# } else {
+#   lehd_od <- read_parquet_duckdb(
+#     "lehd_files/lehd_od.parquet"
+#   )
+# }
 
 ```
 
 ```{r}
 #| label: function_read_files
 
-read_files_duckdb <- function(file_type) {
-  #create sql statement
-  sql_statement <- paste0(
-    "CREATE TABLE IF NOT EXISTS ",
-    file_type,
-    " AS
-  SELECT * FROM read_csv('lehd_files/*/*",
-    file_type,
-    "*.csv.gz',
-  filename = TRUE)"
+create_parquet <- function(file_type) {
+  csv_pattern <- paste0(file_type, ".*csv.gz")
+  parquet_file <- paste0("lehd_files/lehd_", file_type, ".parquet")
+
+  # verify if parquet file exists, if it does then check for missing files to use as
+  csv_file_list <- list.files(
+    "lehd_files/",
+    pattern = csv_pattern,
+    recursive = TRUE,
+    full.names = TRUE
   )
 
-  dbExecute(
-    lehd_con,
-    sql_statement
-  )
-
-  # get filename list from the table
-  db_files <- tbl(lehd_con, file_type) |>
+  if (file.exists(parquet_file)) {
+    parquet_file_list <- read_parquet_duckdb(parquet_file) |>
       select(filename) |>
       distinct() |>
-      collect() |>
-      pull() |>
-      #replace backslashes with forward slashes
-      str_replace_all("\\\\", "/")
+      pull()
 
+    csv_file_list <- setdiff(csv_file_list, parquet_file_list)
 
-    # get list of downloaded files
-  local_files <- list.files(
-      "lehd_files/",
-      pattern = paste0(file_type, ".*csv.gz"),
-      recursive = TRUE,
-      full.names = TRUE
+    if (file_type == "od") {
+      csv_file_list <- csv_file_list |>
+        read_csv_duckdb(
+          options = list(filename = TRUE)
+        ) |>
+        mutate(
+          w_state = dd$left(w_geocode, 2L),
+          h_state = dd$left(h_geocode, 2L)
+        ) |>
+        filter(h_state == "08" | w_state == "08") |>
+        pull(filename)
+    }
+  }
+
+  if (length(csv_file_list) > 0) {
+    if (file_type == "od") {
+      parquet_tbl <- duckplyr::read_csv_duckdb(
+        csv_file_list,
+        options = list(
+          filename = TRUE
+        )
+      ) |>
+        select(w_geocode, h_geocode, S000, filename) |>
+        mutate(
+          year = as.integer(dd$regexp_extract(filename, "\\d{4}")),
+          w_geocode = dd$left(w_geocode, 5L),
+          w_state = dd$left(w_geocode, 2L),
+          w_cty = dd$substr(w_geocode, 3L, 5L),
+          h_geocode = dd$left(h_geocode, 5L),
+          h_state = dd$left(h_geocode, 2L),
+          h_cty = dd$substr(h_geocode, 3L, 5L),
+          same_county = as.integer(w_geocode == h_geocode),
+          .before = 1
+        ) |>
+        filter(h_state == "08" | w_state == "08")
+    } else {
+      parquet_tbl <- duckplyr::read_csv_duckdb(
+        csv_file_list,
+        options = list(
+          union_by_name = TRUE,
+          filename = TRUE
+        )
+      )
+    }
+
+    compute_parquet(
+      parquet_tbl,
+      parquet_file
     )
-  
-  missing_files <- setdiff(local_files, db_files)
 
-  # get column types for the table
-  col_types <- dbGetQuery(
-    lehd_con,
-    paste0("PRAGMA table_info('", file_type, "')")
-  ) |>
-    filter(name != "filename") |>
-    select(name, type) |>
-    deframe()
-
-  # append missing files to the table
-  if (length(missing_files) > 0) {
-    duckdb_read_csv(
-      lehd_con,
-      name = file_type,
-      missing_files
-    )
+    return(paste0("Processed ", file_type, " files to ", parquet_file))
+  } else {
+    return(paste0("No new ", file_type, " files to process"))
   }
 }
 
 c("wac", "od", "xwalk") |>
-  map(read_files_duckdb)
-
+  map(create_parquet)
 
 
 ```
@@ -255,14 +328,14 @@ c("wac", "od", "xwalk") |>
 
 ```{r}
 # read in wac
-lehd_mhj <- tbl(lehd_con, "wac") |>
+lehd_mhj <- read_parquet_duckdb("lehd_files/lehd_wac.parquet") |>
   select(w_geocode, C000, filename) |>
   mutate(
-    w_geocode = str_sub(w_geocode, 1, 5),
-    w_state = str_sub(w_geocode, 1, 2),
-    w_cty = str_sub(w_geocode, 3, 5),
-    job_type = regexp_extract(filename, "JT.."),
-    year = as.integer(regexp_extract(filename, "\\d{4}")),
+    year = as.integer(dd$regexp_extract(filename, "\\d{4}")),
+    w_geocode = dd$left(w_geocode, 5L),
+    w_state = dd$left(w_geocode, 2L),
+    w_cty = dd$substr(w_geocode, 3L, 5L),
+    job_type = dd$regexp_extract(filename, "JT.."),
     .after = w_geocode
   ) |>
   summarize(
@@ -283,7 +356,18 @@ lehd_mhj <- tbl(lehd_con, "wac") |>
 ```
 
 ```{r}
-dbWriteTable(lehd_con, "lehd_mhj", lehd_mhj, overwrite = TRUE)
+#| label: write_mhj
+
+# write the lehd_mhj table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_mhj"),
+  lehd_mhj,
+  overwrite = TRUE,
+  row.names = FALSE
+)
+
+# write to csv
 
 write_csv(lehd_mhj, "lehd_mhj.csv")
 ```
@@ -299,21 +383,10 @@ Next read in the LEHD crosswalk file and create a function to read in and proces
 This function reads in the data and processes it to calculate inflow, outflow, and net commuters by county. It also saves the data as an rds file to avoid having to read in the data again.
 
 ```{r}
-
 # read in LEHD data
-lehd_commute <- tbl(lehd_con, "od") |>
-  select(w_geocode, h_geocode, S000, filename) |>
-  mutate(
-    w_geocode = str_sub(w_geocode, 1, 5),
-    w_state = str_sub(w_geocode, 1, 2),
-    w_cty = str_sub(w_geocode, 3, 5),
-    h_geocode = str_sub(h_geocode, 1, 5),
-    h_state = str_sub(h_geocode, 1, 2),
-    h_cty = str_sub(h_geocode, 3, 5),
-    year = as.integer(regexp_extract(filename, "\\d{4}")),
-    same_county = as.integer(w_geocode == h_geocode)
-  ) |>
-  filter(h_state == "08" | w_state == "08") |>
+lehd_commute <- read_parquet_duckdb(
+  "lehd_files/lehd_od.parquet"
+) |>
   summarise(
     total = sum(S000, na.rm = TRUE),
     .by = c(
@@ -328,17 +401,23 @@ lehd_commute <- tbl(lehd_con, "od") |>
   mutate(
     total_live_work = total * same_county,
     total_commute = total - total_live_work
-  )
+  ) |>
+  collect()
 
+# write the lehd_commute table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_commute"),
+  lehd_commute,
+  overwrite = TRUE,
+  row.names = FALSE
+)
 ```
 
 ```{r}
-dbWriteTable(lehd_con, "lehd_commute", collect(lehd_commute), overwrite = TRUE)
-```
-
-```{r}
+#| label: calculate_lehd_workers
 # calculate inflow commuters
-lehd_workers <- tbl(lehd_con, "lehd_commute") |>
+lehd_workers <- lehd_commute |>
   filter(w_state == "08") |>
   summarize(
     total_commute_in = sum(total_commute),
@@ -347,17 +426,24 @@ lehd_workers <- tbl(lehd_con, "lehd_commute") |>
   ) |>
   arrange(year, w_state, w_cty)
 
-```
+# write the lehd_workers table to Postgres
+dbWriteTable(
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_workers"),
+  collect(lehd_workers),
+  overwrite = TRUE,
+  row.names = FALSE
+)
 
-```{r}
-dbWriteTable(lehd_con, "lehd_workers", collect(lehd_workers), overwrite = TRUE)
 lehd_workers <- tbl(lehd_con, "lehd_workers")
 
 ```
 
 ```{r}
+#| label: calculate_lehd_residents
+
 # calculate outflow commuters
-lehd_residents <- tbl(lehd_con, "lehd_commute") |>
+lehd_residents <- lehd_commute |>
   filter(h_state == "08") |>
   summarize(
     total_commute_out = -sum(total_commute),
@@ -365,23 +451,24 @@ lehd_residents <- tbl(lehd_con, "lehd_commute") |>
   ) |>
   arrange(year, h_state, h_cty)
 
+# wrote the lehd_residents table to Postgres
 dbWriteTable(
-  lehd_con,
-  "lehd_residents",
-  collect(lehd_residents),
-  overwrite = TRUE
+  pg_sdo,
+  name = Id(schema = "econ", table = "lehd_residents"),
+  lehd_residents,
+  overwrite = TRUE,
+  row.names = FALSE
 )
-lehd_residents <- tbl(lehd_con, "lehd_residents")
-lehd_residents
+
+
 ```
 
 ```{r}
-
 # calculate net commuter
-lehd_net <- collect(lehd_workers) |>
+lehd_net <- lehd_workers |>
   rename(cty = w_cty) |>
   full_join(
-    collect(lehd_residents) |>
+    lehd_residents |>
       rename(cty = h_cty)
   ) |>
   mutate(
@@ -399,47 +486,6 @@ lehd_net <- collect(lehd_workers) |>
   ) |>
   arrange(year, county_fips)
 
-```
-
-```{r}
-dbWriteTable(lehd_con, "lehd_net", lehd_net, overwrite = TRUE)
-
-lehd_net
-```
-
-```{r}
-write_csv(lehd_net, "lehd_commute.csv")
-```
-
-
-# Write to Postgres
-
-Once created the files are uploaded to the SDO Postgres Table.
-
-```{r}
-#| label: write_to_postgres
-
-# connect to the Postgres database
-pg_sdo <- DBI::dbConnect(
-  RPostgres::Postgres(),
-  dbname = 'dola',
-  host = '104.197.26.248',
-  port = 5433,
-  user = "postgres",
-  password = keyring::key_get("pgsdo", "dola")
-)
-
-connections::connection_view(pg_sdo)
-
-# write the lehd_mhj table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_mhj"),
-  lehd_mhj,
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
 # write the lehd_net table to Postgres
 dbWriteTable(
   pg_sdo,
@@ -449,35 +495,6 @@ dbWriteTable(
   row.names = FALSE
 )
 
-# write the lehd_commute table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_commute"),
-  collect(lehd_commute),
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
-# write the lehd_workers table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_workers"),
-  collect(lehd_workers),
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
-# wrote the lehd_residents table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_residents"),
-  collect(lehd_residents),
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
-# disconnect from the Postgres database
-dbDisconnect(pg_sdo)
-dbDisconnect(lehd_con)
-
+write_csv(lehd_net, "lehd_commute.csv")
 ```
+
