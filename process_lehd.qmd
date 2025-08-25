@@ -36,8 +36,10 @@ First we create a function that can be used for downloading data from the LEHD s
 state_codes <- duckdb_read_csv(
   lehd_con,
   "state_codes",
-  "lehd_files/state_codes.txt"
+  "lehd_files/state_codes.txt",
+  temporary = TRUE
 )
+
 
 ```
 
@@ -176,37 +178,80 @@ od_results <- pmap(
 
 ```
 
-```{r}
-# read in wac
-dbExecute(
-  lehd_con,
-  "CREATE OR REPLACE TABLE wac AS
-  SELECT * FROM read_csv('lehd_files/*/*wac*.csv.gz',
-  filename = TRUE)"
-)
+``` {r}
+# create function to convert to parquet
+
+
+
+
 ```
 
 ```{r}
+#| label: function_read_files
 
-dbExecute(
-  lehd_con,
-  "CREATE OR REPLACE TABLE od AS
-  SELECT * FROM read_csv('lehd_files/*/*od*.csv.gz',
-  union_by_name = TRUE,
-  null_padding = TRUE,
+read_files_duckdb <- function(file_type) {
+  #create sql statement
+  sql_statement <- paste0(
+    "CREATE TABLE IF NOT EXISTS ",
+    file_type,
+    " AS
+  SELECT * FROM read_csv('lehd_files/*/*",
+    file_type,
+    "*.csv.gz',
   filename = TRUE)"
-)
+  )
+
+  dbExecute(
+    lehd_con,
+    sql_statement
+  )
+
+  # get filename list from the table
+  db_files <- tbl(lehd_con, file_type) |>
+      select(filename) |>
+      distinct() |>
+      collect() |>
+      pull() |>
+      #replace backslashes with forward slashes
+      str_replace_all("\\\\", "/")
+
+
+    # get list of downloaded files
+  local_files <- list.files(
+      "lehd_files/",
+      pattern = paste0(file_type, ".*csv.gz"),
+      recursive = TRUE,
+      full.names = TRUE
+    )
+  
+  missing_files <- setdiff(local_files, db_files)
+
+  # get column types for the table
+  col_types <- dbGetQuery(
+    lehd_con,
+    paste0("PRAGMA table_info('", file_type, "')")
+  ) |>
+    filter(name != "filename") |>
+    select(name, type) |>
+    deframe()
+
+  # append missing files to the table
+  if (length(missing_files) > 0) {
+    duckdb_read_csv(
+      lehd_con,
+      name = file_type,
+      missing_files
+    )
+  }
+}
+
+c("wac", "od", "xwalk") |>
+  map(read_files_duckdb)
+
+
+
 ```
 
-```{r}
-# read in crosswalks
-dbExecute(
-  lehd_con,
-  "CREATE OR REPLACE TABLE lehd_crosswalks AS
-  SELECT * FROM read_csv('lehd_files/xwalk/*xwalk*.csv.gz',
-  filename = TRUE)"
-)
-```
 
 ```{r}
 # read in wac
@@ -307,7 +352,7 @@ lehd_workers <- tbl(lehd_con, "lehd_commute") |>
 ```{r}
 dbWriteTable(lehd_con, "lehd_workers", collect(lehd_workers), overwrite = TRUE)
 lehd_workers <- tbl(lehd_con, "lehd_workers")
-lehd_workers
+
 ```
 
 ```{r}
@@ -366,9 +411,6 @@ lehd_net
 write_csv(lehd_net, "lehd_commute.csv")
 ```
 
-```{r}
-dbDisconnect(lehd_con)
-```
 
 # Write to Postgres
 
@@ -436,5 +478,6 @@ dbWriteTable(
 
 # disconnect from the Postgres database
 dbDisconnect(pg_sdo)
+dbDisconnect(lehd_con)
 
 ```
