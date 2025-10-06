@@ -14,19 +14,13 @@ library(xml2)
 library(RPostgres)
 library(keyring)
 library(duckplyr)
+library(sdodemog)
 ```
 
 ```{r}
 #| label: connect_to_postgres
 # connect to the Postgres database
-pg_sdo <- DBI::dbConnect(
-  RPostgres::Postgres(),
-  dbname = 'dola',
-  host = '104.197.26.248',
-  port = 5433,
-  user = "postgres",
-  password = keyring::key_get("pgsdo", "dola")
-)
+pg_sdo <- connect_to_sdo_db()
 
 connections::connection_view(pg_sdo)
 
@@ -398,16 +392,12 @@ lehd_commute <- read_parquet_duckdb(
       same_county
     )
   ) |>
-  mutate(
-    total_live_work = total * same_county,
-    total_commute = total - total_live_work
-  ) |>
   collect()
 
 # write the lehd_commute table to Postgres
 dbWriteTable(
   pg_sdo,
-  name = Id(schema = "econ", table = "lehd_commute"),
+  name = Id(schema = "econ", table = "lehd_commute_raw"),
   lehd_commute,
   overwrite = TRUE,
   row.names = FALSE
@@ -416,85 +406,103 @@ dbWriteTable(
 
 ```{r}
 #| label: calculate_lehd_workers
-# calculate inflow commuters
-lehd_workers <- lehd_commute |>
-  filter(w_state == "08") |>
-  summarize(
-    total_commute_in = sum(total_commute),
-    total_live_work = sum(total_live_work),
-    .by = c(year, w_state, w_cty)
+
+commute_counties <- pull_db_table("xwalk", "area_pm") |>
+  # tbl(pg_sdo, Id(schema = "xwalk", table = "area_pm")) |>
+  pivot_wider(names_from = area_type, values_from = area_id) |>
+  mutate(
+    across(everything(), ~ paste0("08", .x))
   ) |>
-  arrange(year, w_state, w_cty)
+  select(-county_fips)
 
-# write the lehd_workers table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_workers"),
-  collect(lehd_workers),
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
-lehd_workers <- tbl(lehd_con, "lehd_workers")
-
-```
-
-```{r}
-#| label: calculate_lehd_residents
-
-# calculate outflow commuters
-lehd_residents <- lehd_commute |>
-  filter(h_state == "08") |>
-  summarize(
-    total_commute_out = -sum(total_commute),
-    .by = c(year, h_state, h_cty)
+# import the county level LEHD commuting data
+commute_raw <- pull_db_table("econ", "lehd_commute_raw") |>
+  # tbl(pg_sdo, Id(schema = "econ", table = "lehd_commute_raw")) |>
+  mutate(
+    h_county = paste0(h_state, h_cty),
+    w_county = paste0(w_state, w_cty),
+    h_state = paste0(h_state, "000"),
+    w_state = paste0(w_state, "000")
   ) |>
-  arrange(year, h_state, h_cty)
-
-# wrote the lehd_residents table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_residents"),
-  lehd_residents,
-  overwrite = TRUE,
-  row.names = FALSE
-)
-
-
-```
-
-```{r}
-# calculate net commuter
-lehd_net <- lehd_workers |>
-  rename(cty = w_cty) |>
-  full_join(
-    lehd_residents |>
-      rename(cty = h_cty)
+  select(year, h_county, h_state, w_county, w_state, total) |>
+  left_join(
+    commute_counties |> rename_with(~ paste0("h_", .x))
+  ) |>
+  left_join(
+    commute_counties |> rename_with(~ paste0("w_", .x))
   ) |>
   mutate(
-    across(starts_with("total"), ~ replace_na(., 0)),
-    year = year,
-    net_commute = total_commute_in + total_commute_out
+    id = row_number(),
+    across(ends_with("region"), ~ replace_na(.x, "99999")),
+    .before = 1
   ) |>
-  select(
-    year,
-    county_fips = cty,
-    total_live_work,
-    total_commute_in,
-    total_commute_out,
-    net_commute
+  pivot_longer(
+    cols = starts_with(c("h_", "w_")),
+    names_to = c("home_work", "area_type"),
+    names_sep = "_",
+    values_to = "area_id"
   ) |>
-  arrange(year, county_fips)
+  pivot_wider(names_from = home_work, values_from = area_id) |>
+  mutate(same_area = (h == w)) |>
+  collect()
 
-# write the lehd_net table to Postgres
+commute_in <- commute_raw |>
+  filter(!same_area) |>
+  rename(area_id = w) |>
+  summarize(
+    var = "in",
+    total = sum(total),
+    .by = c(year, area_type, area_id)
+  )
+
+commute_out <- commute_raw |>
+  filter(!same_area) |>
+  rename(area_id = h) |>
+  summarize(
+    var = "out",
+    total = sum(total),
+    .by = c(year, area_type, area_id)
+  )
+
+commute_same <- commute_raw |>
+  filter(same_area) |>
+  rename(area_id = h) |>
+  summarize(
+    var = "same",
+    total = sum(total),
+    .by = c(year, area_type, area_id)
+  )
+
+commute_all <- bind_rows(
+  commute_in,
+  commute_out,
+  commute_same
+) |>
+  filter(
+    area_id %in% paste0("08", pull_db_table("xwalk", "area") |> pull(area_id))
+  )
+
+commute_calcs <- commute_all |>
+  pivot_wider(names_from = var, values_from = total) |>
+  mutate(
+    area_id = str_sub(area_id, 3, 5),
+    net = `in` - out
+  ) |>
+  arrange(area_id, year) |>
+  select(area_type)
+
+commute_calcs |>
+  summarize(net = sum(net), .by = c(year, area_type)) |>
+  pivot_wider(names_from = "area_type", values_from = net) |>
+  mutate(check = ((state == region) & (state == county))) |>
+  filter(!check) |>
+  arrange(year)
+
 dbWriteTable(
   pg_sdo,
-  name = Id(schema = "econ", table = "lehd_net"),
-  lehd_net,
-  overwrite = TRUE,
-  row.names = FALSE
+  Id("econ", "commute"),
+  select(commute_calcs, -area_type),
+  overwrite = TRUE
 )
 
-write_csv(lehd_net, "lehd_commute.csv")
 ```
-
