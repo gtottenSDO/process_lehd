@@ -12,9 +12,9 @@ library(connections)
 library(httr2)
 library(xml2)
 library(RPostgres)
-library(keyring)
 library(duckplyr)
 library(sdodemog)
+
 ```
 
 ```{r}
@@ -267,31 +267,38 @@ create_parquet <- function(file_type) {
           h_state = dd$left(h_geocode, 2L)
         ) |>
         filter(h_state == "08" | w_state == "08") |>
-        pull(filename)
+        distinct(filename) |>
+        pull()
     }
   }
 
   if (length(csv_file_list) > 0) {
     if (file_type == "od") {
-      parquet_tbl <- duckplyr::read_csv_duckdb(
-        csv_file_list,
-        options = list(
-          filename = TRUE
-        )
-      ) |>
-        select(w_geocode, h_geocode, S000, filename) |>
-        mutate(
-          year = as.integer(dd$regexp_extract(filename, "\\d{4}")),
-          w_geocode = dd$left(w_geocode, 5L),
-          w_state = dd$left(w_geocode, 2L),
-          w_cty = dd$substr(w_geocode, 3L, 5L),
-          h_geocode = dd$left(h_geocode, 5L),
-          h_state = dd$left(h_geocode, 2L),
-          h_cty = dd$substr(h_geocode, 3L, 5L),
-          same_county = as.integer(w_geocode == h_geocode),
-          .before = 1
+      process_csv <- function(csv_file) {
+        duckplyr::read_csv_duckdb(
+          csv_file,
+          options = list(
+            filename = TRUE
+          )
         ) |>
-        filter(h_state == "08" | w_state == "08")
+          collect() |> 
+          select(w_geocode, h_geocode, S000, filename) |>
+          mutate(
+            year = as.integer(str_extract(filename, "\\d{4}")),
+            w_geocode = str_sub(w_geocode, 1, 5),
+            w_state = str_sub(w_geocode, 1, 2),
+            w_cty = str_sub(w_geocode, 3, 5),
+            h_geocode = str_sub(h_geocode, 1, 5),
+            h_state = str_sub(h_geocode, 1, 2),
+            h_cty = str_sub(h_geocode, 3, 5),
+            same_county = as.integer(w_geocode == h_geocode),
+            .before = 1
+          ) |>
+          filter(h_state == "08" | w_state == "08") |> 
+          compute_parquet(parquet_file)
+      }
+
+      map(csv_file_list, process_csv)
     } else {
       parquet_tbl <- duckplyr::read_csv_duckdb(
         csv_file_list,
@@ -299,13 +306,9 @@ create_parquet <- function(file_type) {
           union_by_name = TRUE,
           filename = TRUE
         )
-      )
+      ) |>
+        compute_parquet(parquet_file)
     }
-
-    compute_parquet(
-      parquet_tbl,
-      parquet_file
-    )
 
     return(paste0("Processed ", file_type, " files to ", parquet_file))
   } else {
@@ -322,7 +325,7 @@ c("wac", "od", "xwalk") |>
 
 ```{r}
 # read in wac
-lehd_mhj <- read_parquet_duckdb("lehd_files/lehd_wac.parquet") |>
+lehd_mjh <- read_parquet_duckdb("lehd_files/lehd_wac.parquet") |>
   select(w_geocode, C000, filename) |>
   mutate(
     year = as.integer(dd$regexp_extract(filename, "\\d{4}")),
@@ -350,20 +353,52 @@ lehd_mhj <- read_parquet_duckdb("lehd_files/lehd_wac.parquet") |>
 ```
 
 ```{r}
-#| label: write_mhj
+# compare years against the previous version of the data to see if there are any differences
+lehd_postgres <- pull_db_table("econ", "lehd_mjh")
 
-# write the lehd_mhj table to Postgres
+lehd_mjh |>
+  full_join(
+    lehd_postgres,
+    by = c("area_fips", "state_fips", "county_fips", "year"),
+    suffix = c("_new", "_old")
+  ) |>
+  mutate(mjh_diff = mult_job_hldg_rate_new - mult_job_hldg_rate_old) |>
+  count(year, mjh_diff) |>
+  filter(is.na(mjh_diff) | n != 64)
+
+lehd_append <- lehd_mjh |>
+  anti_join(
+    lehd_postgres,
+    by = c("area_fips", "state_fips", "county_fips", "year")
+  )
+
+```
+
+```{r}
+#| label: write_mjh
+
+# write the lehd_mjh table to Postgres
 dbWriteTable(
   pg_sdo,
-  name = Id(schema = "econ", table = "lehd_mhj"),
-  lehd_mhj,
-  overwrite = TRUE,
+  name = Id(schema = "econ", table = "lehd_mjh"),
+  lehd_append,
+  append = TRUE,
   row.names = FALSE
 )
 
+lehd_mjh |>
+  full_join(
+    pull_db_table("econ", "lehd_mjh"),
+    by = c("area_fips", "state_fips", "county_fips", "year"),
+    suffix = c("_new", "_old")
+  ) |>
+  mutate(mjh_diff = mult_job_hldg_rate_new - mult_job_hldg_rate_old) |>
+  count(year, mjh_diff) |>
+  filter(is.na(mjh_diff) | n != 64)
+
 # write to csv
 
-write_csv(lehd_mhj, "lehd_mhj.csv")
+write_csv(lehd_mjh, "lehd_mjh.csv")
 ```
 
 # Calculate Commuting Flows
@@ -377,8 +412,10 @@ Next read in the LEHD crosswalk file and create a function to read in and proces
 This function reads in the data and processes it to calculate inflow, outflow, and net commuters by county. It also saves the data as an rds file to avoid having to read in the data again.
 
 ```{r}
+#| label: read_lehd_od
+
 # read in LEHD data
-lehd_commute <- read_parquet_duckdb(
+od_raw <- read_parquet_duckdb(
   "lehd_files/lehd_od.parquet"
 ) |>
   summarise(
@@ -394,19 +431,6 @@ lehd_commute <- read_parquet_duckdb(
   ) |>
   collect()
 
-# write the lehd_commute table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_commute_raw"),
-  lehd_commute,
-  overwrite = TRUE,
-  row.names = FALSE
-)
-```
-
-```{r}
-#| label: calculate_lehd_workers
-
 commute_counties <- pull_db_table("xwalk", "area_pm") |>
   # tbl(pg_sdo, Id(schema = "xwalk", table = "area_pm")) |>
   pivot_wider(names_from = area_type, values_from = area_id) |>
@@ -415,8 +439,26 @@ commute_counties <- pull_db_table("xwalk", "area_pm") |>
   ) |>
   select(-county_fips)
 
+```
+
+
+```{r}
+
+# write the lehd_commute table to Postgres
+# dbWriteTable(
+#   pg_sdo,
+#   name = Id(schema = "econ", table = "lehd_commute_raw"),
+#   lehd_commute,
+#   overwrite = TRUE,
+#   row.names = FALSE
+# )
+```
+
+```{r}
+#| label: calculate_lehd_workers
+
 # import the county level LEHD commuting data
-commute_raw <- pull_db_table("econ", "lehd_commute_raw") |>
+commute_raw <- od_raw |>
   # tbl(pg_sdo, Id(schema = "econ", table = "lehd_commute_raw")) |>
   mutate(
     h_county = paste0(h_state, h_cty),
@@ -443,8 +485,11 @@ commute_raw <- pull_db_table("econ", "lehd_commute_raw") |>
     values_to = "area_id"
   ) |>
   pivot_wider(names_from = home_work, values_from = area_id) |>
-  mutate(same_area = (h == w)) |>
-  collect()
+  mutate(same_area = (h == w))
+
+```
+
+```{r}
 
 commute_in <- commute_raw |>
   filter(!same_area) |>
