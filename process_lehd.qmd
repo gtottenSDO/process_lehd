@@ -5,6 +5,8 @@
 The following notebook is for processing LEHD files
 
 ```{r}
+#| label: setup
+# load packages
 library(tidyverse)
 library(DBI)
 library(dbplyr)
@@ -14,6 +16,10 @@ library(xml2)
 library(RPostgres)
 library(duckplyr)
 library(sdodemog)
+library(writexl)
+
+# create parameter update_postgres to determine whether to write to postgres or not
+update_postgres <- FALSE
 ```
 
 
@@ -353,13 +359,15 @@ lehd_append <- lehd_mjh |>
 ```{r}
 #| label: write_mjh
 # write the lehd_mjh table to Postgres
-dbWriteTable(
-  pg_sdo,
-  name = Id(schema = "econ", table = "lehd_mjh"),
-  lehd_append,
-  append = TRUE,
-  row.names = FALSE
-)
+if (update_postgres) {
+  dbWriteTable(
+    pg_sdo,
+    name = Id(schema = "econ", table = "lehd_mjh"),
+    lehd_append,
+    append = TRUE,
+    row.names = FALSE
+  )
+}
 
 lehd_mjh |>
   full_join(
@@ -464,7 +472,7 @@ commute_in <- commute_raw |>
   filter(!same_area) |>
   rename(area_id = w) |>
   summarize(
-    var = "in",
+    var = "commute_in",
     total = sum(total),
     .by = c(year, area_type, area_id)
   )
@@ -473,7 +481,7 @@ commute_out <- commute_raw |>
   filter(!same_area) |>
   rename(area_id = h) |>
   summarize(
-    var = "out",
+    var = "commute_out",
     total = sum(total),
     .by = c(year, area_type, area_id)
   )
@@ -482,7 +490,7 @@ commute_same <- commute_raw |>
   filter(same_area) |>
   rename(area_id = h) |>
   summarize(
-    var = "same",
+    var = "live_work",
     total = sum(total),
     .by = c(year, area_type, area_id)
   )
@@ -500,21 +508,37 @@ commute_calcs <- commute_all |>
   pivot_wider(names_from = var, values_from = total) |>
   mutate(
     area_id = str_sub(area_id, 3, 5),
-    net = `in` - out
+    commute_net = `commute_in` - `commute_out`
   ) |>
   arrange(area_id, year)
 
 commute_calcs |>
-  summarize(net = sum(net), .by = c(year, area_type)) |>
-  pivot_wider(names_from = "area_type", values_from = net) |>
+  summarize(commute_net = sum(commute_net), .by = c(year, area_type)) |>
+  pivot_wider(names_from = "area_type", values_from = commute_net) |>
   mutate(check = ((state == region) & (state == county))) |>
   filter(!check) |>
   arrange(year)
 
-dbWriteTable(
-  pg_sdo,
-  Id("econ", "commute"),
-  select(commute_calcs, -area_type),
-  overwrite = TRUE
-)
+if (update_postgres) {
+  dbWriteTable(
+    pg_sdo,
+    Id("econ", "commute"),
+    select(commute_calcs, -area_type),
+    overwrite = TRUE
+  )
+}
+```
+
+```{r}
+# create excel file with commuting and multiple job holding data for each county and year
+lehd_output <- commute_calcs |>
+  left_join(
+    lehd_mjh,
+    by = c("area_id" = "county_fips", "year"),
+    relationship = "one-to-one"
+  ) |>
+    left_join(pull_db_table("xwalk", "area") |> select(area_id, area_name), by = c("area_id")) |>
+  select(area_type, area_id, area_name, year, commute_in, commute_out, commute_net, all_jobs, primary_jobs, mult_job_hldg_rate)
+
+write_xlsx(lehd_output, "lehd_commute_mjh.xlsx")
 ```
